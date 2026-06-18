@@ -1,27 +1,29 @@
 {
   "name": "aws-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Serverless Chat Backend — AWS Lambda + DynamoDB + API Gateway (local emulation)",
+  "main": "handler.js",
   "scripts": {
     "start:db": "dynalite --port 8000",
     "init:db": "node init-db.js",
     "start:serverless": "serverless offline start",
-    "start": "start npm run start:db && timeout 2 && npm run init:db && npm run start:serverless"
+    "dev": "npm run init:db && npm run start:serverless"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": ["serverless","aws","lambda","dynamodb","websocket","chat"],
+  "author": "Atharv Kadre",
   "license": "ISC",
   "type": "commonjs",
-  "devDependencies": {
+  "dependencies": {
     "@aws-sdk/client-apigatewaymanagementapi": "^3.1071.0",
     "@aws-sdk/client-dynamodb": "^3.1071.0",
+    "@aws-sdk/lib-dynamodb": "^3.1071.0",
+    "@google/generative-ai": "^0.24.1",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
     "dynalite": "^4.0.0",
     "serverless": "^3.40.0",
-    "serverless-dynamodb": "^0.2.58",
-    "serverless-offline": "^13.10.1"
-  },
-  "dependencies": {
+    "serverless-offline": "^13.10.1",
     "ws": "^8.21.0"
   }
 }

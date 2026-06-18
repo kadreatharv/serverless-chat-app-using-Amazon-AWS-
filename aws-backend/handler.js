@@ -1,33 +1,39 @@
+require('dotenv').config();
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { PutCommand, DeleteCommand, ScanCommand, QueryCommand, DynamoDBDocumentClient } = require('@aws-sdk/lib-dynamodb');
+const {
+  PutCommand, DeleteCommand, ScanCommand,
+  QueryCommand, GetCommand, DynamoDBDocumentClient
+} = require('@aws-sdk/lib-dynamodb');
 const { ApiGatewayManagementApiClient, PostToConnectionCommand } = require('@aws-sdk/client-apigatewaymanagementapi');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const CONNECTIONS_TABLE = process.env.CONNECTIONS_TABLE;
 const MESSAGES_TABLE = process.env.MESSAGES_TABLE;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const IS_OFFLINE = process.env.IS_OFFLINE;
 
-let dynamoDbClient;
-if (IS_OFFLINE === 'true') {
-  dynamoDbClient = new DynamoDBClient({
-    region: 'localhost',
-    endpoint: 'http://localhost:8000',
-    credentials: { accessKeyId: 'DEFAULT', secretAccessKey: 'DEFAULT' }
-  });
-} else {
-  dynamoDbClient = new DynamoDBClient({});
-}
+// DynamoDB client — uses local emulator if offline
+const dynamoDbClient = IS_OFFLINE === 'true'
+  ? new DynamoDBClient({
+      region: 'localhost',
+      endpoint: 'http://localhost:8000',
+      credentials: { accessKeyId: 'DEFAULT', secretAccessKey: 'DEFAULT' }
+    })
+  : new DynamoDBClient({});
 
 const docClient = DynamoDBDocumentClient.from(dynamoDbClient);
 const success = { statusCode: 200, body: 'Success' };
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
 function getApiGatewayClient(event) {
-  let endpoint = `https://${event.requestContext.domainName}/${event.requestContext.stage}`;
-  if (IS_OFFLINE === 'true') {
-    endpoint = 'http://localhost:4001';
-  }
-  return new ApiGatewayManagementApiClient({ apiVersion: '2018-11-29', endpoint });
+  const endpoint = IS_OFFLINE === 'true'
+    ? 'http://localhost:4001'
+    : `https://${event.requestContext.domainName}/${event.requestContext.stage}`;
+  return new ApiGatewayManagementApiClient({ endpoint });
 }
 
+// Get all active connections in a specific room
 async function getRoomConnections(roomName) {
   const data = await docClient.send(new ScanCommand({
     TableName: CONNECTIONS_TABLE,
@@ -37,29 +43,88 @@ async function getRoomConnections(roomName) {
   return data.Items || [];
 }
 
+// Broadcast a JSON payload to a list of connections, removing stale ones
+async function broadcast(apigw, connections, payload, excludeConnectionId = null) {
+  const data = Buffer.from(JSON.stringify(payload));
+  await Promise.all(
+    connections
+      .filter(c => c.connectionId !== excludeConnectionId)
+      .map(async ({ connectionId }) => {
+        try {
+          await apigw.send(new PostToConnectionCommand({ ConnectionId: connectionId, Data: data }));
+        } catch (e) {
+          if (e.statusCode === 410 || e.$metadata?.httpStatusCode === 410) {
+            await docClient.send(new DeleteCommand({ TableName: CONNECTIONS_TABLE, Key: { connectionId } }));
+          }
+        }
+      })
+  );
+}
+
+// ─── $connect ────────────────────────────────────────────────────────────────
+
 module.exports.connect = async (event) => {
   const connectionId = event.requestContext.connectionId;
   const username = event.queryStringParameters?.username || 'Anonymous';
   const roomName = event.queryStringParameters?.room || 'General';
 
-  console.log(`User ${username} connected to ${roomName} (${connectionId})`);
+  console.log(`[CONNECT] ${username} → ${roomName} (${connectionId})`);
 
   try {
+    // Save this connection to DynamoDB
     await docClient.send(new PutCommand({
       TableName: CONNECTIONS_TABLE,
       Item: { connectionId, username, roomName }
     }));
   } catch (err) {
-    console.error('Error adding connection:', err);
+    console.error('Error saving connection:', err);
     return { statusCode: 500, body: 'Failed to connect' };
   }
+
+  // Fetch updated room connections and broadcast join notification + user list
+  try {
+    const apigw = getApiGatewayClient(event);
+    const connections = await getRoomConnections(roomName);
+    const userList = connections.map(c => c.username);
+
+    // Notify everyone in the room (including the new joiner)
+    await broadcast(apigw, connections, {
+      action: 'userJoined',
+      username,
+      userList,
+      message: `${username} joined the room`
+    });
+  } catch (err) {
+    console.error('Error broadcasting join:', err);
+  }
+
   return success;
 };
 
+// ─── $disconnect ─────────────────────────────────────────────────────────────
+
 module.exports.disconnect = async (event) => {
   const connectionId = event.requestContext.connectionId;
-  console.log(`Client disconnected: ${connectionId}`);
+  console.log(`[DISCONNECT] ${connectionId}`);
 
+  // Fetch connection details BEFORE deleting so we can notify the room
+  let username = 'Someone';
+  let roomName = 'General';
+
+  try {
+    const result = await docClient.send(new GetCommand({
+      TableName: CONNECTIONS_TABLE,
+      Key: { connectionId }
+    }));
+    if (result.Item) {
+      username = result.Item.username;
+      roomName = result.Item.roomName;
+    }
+  } catch (err) {
+    console.error('Error fetching connection before delete:', err);
+  }
+
+  // Delete from DynamoDB
   try {
     await docClient.send(new DeleteCommand({
       TableName: CONNECTIONS_TABLE,
@@ -68,128 +133,122 @@ module.exports.disconnect = async (event) => {
   } catch (err) {
     console.error('Error removing connection:', err);
   }
+
+  // Broadcast leave notification + updated user list to the remaining users
+  try {
+    const apigw = getApiGatewayClient(event);
+    const connections = await getRoomConnections(roomName); // already deleted above
+    const userList = connections.map(c => c.username);
+
+    await broadcast(apigw, connections, {
+      action: 'userLeft',
+      username,
+      userList,
+      message: `${username} left the room`
+    });
+  } catch (err) {
+    console.error('Error broadcasting leave:', err);
+  }
+
   return success;
 };
 
-module.exports.defaultMessage = async (event) => {
-  return success;
-};
+// ─── $default ────────────────────────────────────────────────────────────────
+
+module.exports.defaultMessage = async () => success;
+
+// ─── sendMessage ─────────────────────────────────────────────────────────────
 
 module.exports.sendMessage = async (event) => {
   let body;
-  try {
-    body = JSON.parse(event.body);
-  } catch (err) { return { statusCode: 400 }; }
+  try { body = JSON.parse(event.body); }
+  catch { return { statusCode: 400, body: 'Invalid JSON' }; }
 
   const apigw = getApiGatewayClient(event);
-  
-  // Save message to DB
+  const roomName = body.roomName || 'General';
+
+  // Build and save the message
   const messageItem = {
-    roomName: body.roomName || 'General',
+    roomName,
     timestamp: Date.now(),
-    messageId: body.id,
-    senderId: body.senderId,
+    messageId: body.id || `msg-${Date.now()}`,
+    senderId: body.senderId || body.username,
     username: body.username,
     text: body.text,
     timeString: body.timestamp
   };
 
   try {
-    await docClient.send(new PutCommand({
-      TableName: MESSAGES_TABLE,
-      Item: messageItem
-    }));
+    await docClient.send(new PutCommand({ TableName: MESSAGES_TABLE, Item: messageItem }));
   } catch (err) {
     console.error('Error saving message:', err);
   }
 
-  // Broadcast to room
-  const connections = await getRoomConnections(messageItem.roomName);
-  
-  const broadcastPayload = JSON.stringify({
-    action: 'receiveMessage',
-    ...messageItem
-  });
+  // Broadcast message to entire room
+  const connections = await getRoomConnections(roomName);
+  await broadcast(apigw, connections, { action: 'receiveMessage', ...messageItem });
 
-  await Promise.all(connections.map(async ({ connectionId }) => {
-    try {
-      await apigw.send(new PostToConnectionCommand({
-        ConnectionId: connectionId,
-        Data: Buffer.from(broadcastPayload)
-      }));
-    } catch (e) {
-      if (e.statusCode === 410 || e.$metadata?.httpStatusCode === 410) {
-        await docClient.send(new DeleteCommand({ TableName: CONNECTIONS_TABLE, Key: { connectionId } }));
+  // ── Real Gemini AI Integration ──────────────────────────────────────────────
+  if (body.text && body.text.toLowerCase().startsWith('@bot ')) {
+    const prompt = body.text.substring(5).trim();
+    let botText = '';
+
+    if (GEMINI_API_KEY) {
+      try {
+        const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+        const result = await model.generateContent(
+          `You are a helpful assistant in a team chat app. Answer concisely and professionally.\n\nUser: ${prompt}`
+        );
+        botText = result.response.text();
+      } catch (aiErr) {
+        console.error('Gemini API error:', aiErr);
+        botText = `Sorry, I ran into an issue while processing your request. (${aiErr.message})`;
       }
+    } else {
+      // Fallback when no API key is set
+      botText = `🤖 **[Mock AI]** You asked: "${prompt}"\n\nTo enable real Gemini AI, add GEMINI_API_KEY to your .env file.`;
     }
-  }));
 
-  // Phase 6: Basic AI Bot Integration
-  if (body.text.toLowerCase().startsWith('@bot ')) {
-    const query = body.text.substring(5).trim();
-    // Simple mock response for now, can be replaced with real Gemini API call
-    const botReply = `Hello ${body.username}! You asked: "${query}". (I am a mock AI bot. Real AI integration coming soon!)`;
-    
     const botMessage = {
-      roomName: messageItem.roomName,
+      roomName,
       timestamp: Date.now() + 1,
       messageId: `bot-${Date.now()}`,
       senderId: 'bot',
-      username: 'AI Assistant',
-      text: botReply,
+      username: 'Nexus AI',
+      text: botText,
       timeString: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     };
 
     await docClient.send(new PutCommand({ TableName: MESSAGES_TABLE, Item: botMessage }));
-    const botPayload = JSON.stringify({ action: 'receiveMessage', ...botMessage });
-
-    await Promise.all(connections.map(async ({ connectionId }) => {
-      try {
-        await apigw.send(new PostToConnectionCommand({ ConnectionId: connectionId, Data: Buffer.from(botPayload) }));
-      } catch (e) {}
-    }));
+    await broadcast(apigw, connections, { action: 'receiveMessage', ...botMessage });
   }
 
   return success;
 };
 
+// ─── typing ──────────────────────────────────────────────────────────────────
+
 module.exports.typing = async (event) => {
   let body;
-  try {
-    body = JSON.parse(event.body);
-  } catch (err) { return { statusCode: 400 }; }
+  try { body = JSON.parse(event.body); }
+  catch { return { statusCode: 400 }; }
 
-  const connections = await getRoomConnections(body.roomName);
   const apigw = getApiGatewayClient(event);
-  
-  const payload = JSON.stringify({
-    action: 'typing',
-    username: body.username
-  });
+  const connections = await getRoomConnections(body.roomName);
 
-  await Promise.all(connections.map(async ({ connectionId }) => {
-    // Don't send typing indicator to the person who is typing
-    if (connectionId !== event.requestContext.connectionId) {
-      try {
-        await apigw.send(new PostToConnectionCommand({
-          ConnectionId: connectionId,
-          Data: Buffer.from(payload)
-        }));
-      } catch (e) {
-        if (e.statusCode === 410 || e.$metadata?.httpStatusCode === 410) {
-          await docClient.send(new DeleteCommand({ TableName: CONNECTIONS_TABLE, Key: { connectionId } }));
-        }
-      }
-    }
-  }));
+  // Send to everyone except the typer
+  await broadcast(apigw, connections, { action: 'typing', username: body.username }, event.requestContext.connectionId);
+
   return success;
 };
 
+// ─── getRecentMessages ───────────────────────────────────────────────────────
+
 module.exports.getRecentMessages = async (event) => {
   let body;
-  try {
-    body = JSON.parse(event.body);
-  } catch (err) { return { statusCode: 400 }; }
+  try { body = JSON.parse(event.body); }
+  catch { return { statusCode: 400 }; }
 
   const roomName = body.roomName || 'General';
   const apigw = getApiGatewayClient(event);
@@ -199,19 +258,16 @@ module.exports.getRecentMessages = async (event) => {
       TableName: MESSAGES_TABLE,
       KeyConditionExpression: 'roomName = :roomName',
       ExpressionAttributeValues: { ':roomName': roomName },
-      ScanIndexForward: false, // get newest first
+      ScanIndexForward: false, // newest first
       Limit: 50
     }));
 
-    // Reverse to send oldest first to client
+    // Reverse so client gets oldest → newest
     const messages = data.Items ? data.Items.reverse() : [];
 
     await apigw.send(new PostToConnectionCommand({
       ConnectionId: event.requestContext.connectionId,
-      Data: Buffer.from(JSON.stringify({
-        action: 'history',
-        messages: messages
-      }))
+      Data: Buffer.from(JSON.stringify({ action: 'history', messages }))
     }));
   } catch (err) {
     console.error('Error fetching history:', err);

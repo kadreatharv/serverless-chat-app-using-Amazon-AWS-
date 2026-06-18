@@ -9,17 +9,26 @@ provider:
   environment:
     CONNECTIONS_TABLE: ${self:service}-connections-${sls:stage}
     MESSAGES_TABLE: ${self:service}-messages-${sls:stage}
+    GEMINI_API_KEY: ${env:GEMINI_API_KEY, ''}
   iam:
     role:
       statements:
+        # Scoped to Connections Table only (Enhancement #7)
         - Effect: Allow
           Action:
             - dynamodb:PutItem
             - dynamodb:DeleteItem
             - dynamodb:Scan
-            - dynamodb:Query
             - dynamodb:GetItem
-          Resource: "*"
+          Resource:
+            - Fn::GetAtt: [ConnectionsTable, Arn]
+        # Scoped to Messages Table only (Enhancement #7)
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:Query
+          Resource:
+            - Fn::GetAtt: [MessagesTable, Arn]
         - Effect: Allow
           Action:
             - execute-api:ManageConnections
@@ -69,6 +78,7 @@ functions:
 
 resources:
   Resources:
+    # Connections Table — stores active connectionId, username, roomName
     ConnectionsTable:
       Type: AWS::DynamoDB::Table
       Properties:
@@ -79,6 +89,21 @@ resources:
         KeySchema:
           - AttributeName: connectionId
             KeyType: HASH
-        ProvisionedThroughput:
-          ReadCapacityUnits: 1
-          WriteCapacityUnits: 1
+        BillingMode: PAY_PER_REQUEST
+
+    # Messages Table — Enhancement #1: proper HASH+RANGE for room-based history queries
+    MessagesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.MESSAGES_TABLE}
+        AttributeDefinitions:
+          - AttributeName: roomName
+            AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: N
+        KeySchema:
+          - AttributeName: roomName
+            KeyType: HASH
+          - AttributeName: timestamp
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
