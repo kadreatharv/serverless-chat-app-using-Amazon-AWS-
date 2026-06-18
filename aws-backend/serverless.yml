@@ -1,0 +1,84 @@
+service: serverless-chat-backend
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: us-east-1
+  environment:
+    CONNECTIONS_TABLE: ${self:service}-connections-${sls:stage}
+    MESSAGES_TABLE: ${self:service}-messages-${sls:stage}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:DeleteItem
+            - dynamodb:Scan
+            - dynamodb:Query
+            - dynamodb:GetItem
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - execute-api:ManageConnections
+          Resource:
+            - "arn:aws:execute-api:*:*:**/@connections/*"
+
+plugins:
+  - serverless-offline
+
+custom:
+  serverless-offline:
+    httpPort: 4000
+    websocketPort: 4001
+    host: localhost
+
+functions:
+  connect:
+    handler: handler.connect
+    events:
+      - websocket:
+          route: $connect
+  disconnect:
+    handler: handler.disconnect
+    events:
+      - websocket:
+          route: $disconnect
+  default:
+    handler: handler.defaultMessage
+    events:
+      - websocket:
+          route: $default
+  sendMessage:
+    handler: handler.sendMessage
+    events:
+      - websocket:
+          route: sendMessage
+  typing:
+    handler: handler.typing
+    events:
+      - websocket:
+          route: typing
+  getRecentMessages:
+    handler: handler.getRecentMessages
+    events:
+      - websocket:
+          route: getRecentMessages
+
+resources:
+  Resources:
+    ConnectionsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.CONNECTIONS_TABLE}
+        AttributeDefinitions:
+          - AttributeName: connectionId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: connectionId
+            KeyType: HASH
+        ProvisionedThroughput:
+          ReadCapacityUnits: 1
+          WriteCapacityUnits: 1
