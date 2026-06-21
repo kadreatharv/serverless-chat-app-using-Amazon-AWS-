@@ -5,7 +5,7 @@ const {
   QueryCommand, GetCommand, DynamoDBDocumentClient
 } = require('@aws-sdk/lib-dynamodb');
 const { ApiGatewayManagementApiClient, PostToConnectionCommand } = require('@aws-sdk/client-apigatewaymanagementapi');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { generateAIResponse } = require('./gemini');
 
 const CONNECTIONS_TABLE = process.env.CONNECTIONS_TABLE;
 const MESSAGES_TABLE = process.env.MESSAGES_TABLE;
@@ -199,24 +199,9 @@ module.exports.sendMessage = async (event) => {
   // ── Real Gemini AI Integration ──────────────────────────────────────────────
   if (body.text && body.text.toLowerCase().startsWith('@bot ')) {
     const prompt = body.text.substring(5).trim();
-    let botText = '';
-
-    if (GEMINI_API_KEY) {
-      try {
-        const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-        const result = await model.generateContent(
-          `You are a helpful assistant in a team chat app. Answer concisely and professionally.\n\nUser: ${prompt}`
-        );
-        botText = result.response.text();
-      } catch (aiErr) {
-        console.error('Gemini API error:', aiErr);
-        botText = `Sorry, I ran into an issue while processing your request. (${aiErr.message})`;
-      }
-    } else {
-      // Fallback when no API key is set
-      botText = `🤖 **[Mock AI]** You asked: "${prompt}"\n\nTo enable real Gemini AI, add GEMINI_API_KEY to your .env file.`;
-    }
+    
+    // Generate response using service module (handles both Gemini API and local mock fallback)
+    const botText = await generateAIResponse(prompt);
 
     const botMessage = {
       roomName,

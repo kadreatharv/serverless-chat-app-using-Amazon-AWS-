@@ -10,16 +10,33 @@ function App() {
   const [typingUsers, setTypingUsers]   = useState(new Set());
   const [onlineUsers, setOnlineUsers]   = useState([]);
   const [notification, setNotification] = useState(null);
+  const [connectionStatus, setConnectionStatus] = useState('disconnected');
 
   const messagesEndRef       = useRef(null);
   const wsRef                = useRef(null);
   const typingTimeoutRef     = useRef(null);
   const userTypingTimeouts   = useRef({});
   const notificationTimeout  = useRef(null);
+  const isJoinedRef          = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimeoutRef  = useRef(null);
+
+  useEffect(() => {
+    isJoinedRef.current = isJoined;
+  }, [isJoined]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typingUsers]);
+
+  useEffect(() => {
+    return () => {
+      clearTimeout(reconnectTimeoutRef.current);
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, []);
 
   // ── Helper: show a brief notification banner ──────────────────────────────
   const showNotification = (msg, type = 'info') => {
@@ -33,18 +50,30 @@ function App() {
     e.preventDefault();
     if (username.trim() && room.trim()) {
       setIsJoined(true);
+      setConnectionStatus('connecting');
+      reconnectAttemptsRef.current = 0;
       connectWebSocket(username.trim(), room);
     }
   };
 
   // ── WebSocket setup ───────────────────────────────────────────────────────
   const connectWebSocket = (user, selectedRoom) => {
+    clearTimeout(reconnectTimeoutRef.current);
+    
+    // If we are currently disconnected/idle, transition to connecting.
+    // If we are already in reconnecting mode, keep the reconnecting state.
+    setConnectionStatus(prev => prev === 'reconnecting' ? 'reconnecting' : 'connecting');
+
     const url = `ws://localhost:4001?username=${encodeURIComponent(user)}&room=${encodeURIComponent(selectedRoom)}`;
+    console.log(`Connecting to WebSocket at ${url}...`);
+    
     const ws  = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
-      console.log('Connected to WebSocket API');
+      console.log('WebSocket connection established.');
+      setConnectionStatus('connected');
+      reconnectAttemptsRef.current = 0;
       ws.send(JSON.stringify({ action: 'getRecentMessages', roomName: selectedRoom }));
     };
 
@@ -92,7 +121,26 @@ function App() {
     };
 
     ws.onclose = () => {
-      console.log('Disconnected');
+      console.log('WebSocket connection closed.');
+      setConnectionStatus('disconnected');
+
+      // If user is still joined (didn't log out), start auto-reconnection
+      if (isJoinedRef.current) {
+        setConnectionStatus('reconnecting');
+        const attempts = reconnectAttemptsRef.current;
+        // Exponential backoff capped at 10 seconds
+        const delay = Math.min(1000 * Math.pow(2, attempts), 10000);
+        console.log(`Reconnecting in ${delay}ms... (attempt ${attempts + 1})`);
+        
+        reconnectTimeoutRef.current = setTimeout(() => {
+          reconnectAttemptsRef.current += 1;
+          connectWebSocket(user, selectedRoom);
+        }, delay);
+      }
+    };
+
+    ws.onerror = (err) => {
+      console.error('WebSocket error encountered:', err);
     };
   };
 
@@ -223,7 +271,8 @@ function App() {
             </div>
           </div>
           <div className="header-right">
-            <div className="status-dot"></div>
+            <div className={`status-dot ${connectionStatus}`} title={`Status: ${connectionStatus}`}></div>
+            <span className="status-text">{connectionStatus}</span>
             <div className="my-avatar" style={{ background: avatarColor(username) }}>
               {getInitials(username)}
             </div>
