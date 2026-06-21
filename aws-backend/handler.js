@@ -10,7 +10,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const CONNECTIONS_TABLE = process.env.CONNECTIONS_TABLE;
 const MESSAGES_TABLE = process.env.MESSAGES_TABLE;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const IS_OFFLINE = process.env.IS_OFFLINE;
+const IS_OFFLINE = (process.env.IS_OFFLINE === 'true' || process.env.IS_OFFLINE === true || !process.env.AWS_EXECUTION_ENV) ? 'true' : 'false';
 
 // DynamoDB client — uses local emulator if offline
 const dynamoDbClient = IS_OFFLINE === 'true'
@@ -27,9 +27,14 @@ const success = { statusCode: 200, body: 'Success' };
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function getApiGatewayClient(event) {
-  const endpoint = IS_OFFLINE === 'true'
-    ? 'http://localhost:4001'
-    : `https://${event.requestContext.domainName}/${event.requestContext.stage}`;
+  if (IS_OFFLINE === 'true') {
+    return new ApiGatewayManagementApiClient({
+      endpoint: 'http://localhost:4001',
+      region: 'us-east-1',
+      credentials: { accessKeyId: 'DEFAULT', secretAccessKey: 'DEFAULT' }
+    });
+  }
+  const endpoint = `https://${event.requestContext.domainName}/${event.requestContext.stage}`;
   return new ApiGatewayManagementApiClient({ endpoint });
 }
 
@@ -55,6 +60,8 @@ async function broadcast(apigw, connections, payload, excludeConnectionId = null
         } catch (e) {
           if (e.statusCode === 410 || e.$metadata?.httpStatusCode === 410) {
             await docClient.send(new DeleteCommand({ TableName: CONNECTIONS_TABLE, Key: { connectionId } }));
+          } else {
+            console.error(`[BROADCAST ERROR] failed for connectionId ${connectionId}:`, e);
           }
         }
       })
@@ -69,6 +76,7 @@ module.exports.connect = async (event) => {
   const roomName = event.queryStringParameters?.room || 'General';
 
   console.log(`[CONNECT] ${username} → ${roomName} (${connectionId})`);
+  console.log('CONNECTIONS_TABLE env:', CONNECTIONS_TABLE, 'MESSAGES_TABLE env:', MESSAGES_TABLE);
 
   try {
     // Save this connection to DynamoDB
@@ -87,13 +95,13 @@ module.exports.connect = async (event) => {
     const connections = await getRoomConnections(roomName);
     const userList = connections.map(c => c.username);
 
-    // Notify everyone in the room (including the new joiner)
+    // Notify everyone in the room (excluding the new joiner to avoid 410 deletion before handshake completes)
     await broadcast(apigw, connections, {
       action: 'userJoined',
       username,
       userList,
       message: `${username} joined the room`
-    });
+    }, connectionId);
   } catch (err) {
     console.error('Error broadcasting join:', err);
   }
@@ -268,6 +276,19 @@ module.exports.getRecentMessages = async (event) => {
     await apigw.send(new PostToConnectionCommand({
       ConnectionId: event.requestContext.connectionId,
       Data: Buffer.from(JSON.stringify({ action: 'history', messages }))
+    }));
+
+    // Send current online user list to the connecting client since they were excluded from the connect broadcast
+    const connections = await getRoomConnections(roomName);
+    const userList = connections.map(c => c.username);
+    await apigw.send(new PostToConnectionCommand({
+      ConnectionId: event.requestContext.connectionId,
+      Data: Buffer.from(JSON.stringify({
+        action: 'userJoined',
+        username: 'System',
+        userList,
+        message: 'Welcome!'
+      }))
     }));
   } catch (err) {
     console.error('Error fetching history:', err);
