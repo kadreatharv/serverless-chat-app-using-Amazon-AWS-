@@ -9,7 +9,14 @@
     "start:serverless": "serverless offline start",
     "dev": "npm run init:db && npm run start:serverless"
   },
-  "keywords": ["serverless","aws","lambda","dynamodb","websocket","chat"],
+  "keywords": [
+    "serverless",
+    "aws",
+    "lambda",
+    "dynamodb",
+    "websocket",
+    "chat"
+  ],
   "author": "Atharv Kadre",
   "license": "ISC",
   "type": "commonjs",

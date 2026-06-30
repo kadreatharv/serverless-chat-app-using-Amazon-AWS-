@@ -1,41 +1,68 @@
 require('dotenv').config();
+
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const {
-  PutCommand, DeleteCommand, ScanCommand,
-  QueryCommand, GetCommand, DynamoDBDocumentClient
+  PutCommand,
+  DeleteCommand,
+  ScanCommand,
+  QueryCommand,
+  GetCommand,
+  DynamoDBDocumentClient
 } = require('@aws-sdk/lib-dynamodb');
-const { ApiGatewayManagementApiClient, PostToConnectionCommand } = require('@aws-sdk/client-apigatewaymanagementapi');
-const { generateAIResponse } = require('./gemini');
+
+const { ApiGatewayManagementApiClient, PostToConnectionCommand } =
+  require('@aws-sdk/client-apigatewaymanagementapi');
+
 
 const CONNECTIONS_TABLE = process.env.CONNECTIONS_TABLE;
 const MESSAGES_TABLE = process.env.MESSAGES_TABLE;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const IS_OFFLINE = (process.env.IS_OFFLINE === 'true' || process.env.IS_OFFLINE === true || !process.env.AWS_EXECUTION_ENV) ? 'true' : 'false';
+const IS_OFFLINE = true;
 
-// DynamoDB client — uses local emulator if offline
-const dynamoDbClient = IS_OFFLINE === 'true'
-  ? new DynamoDBClient({
-      region: 'localhost',
-      endpoint: 'http://localhost:8000',
-      credentials: { accessKeyId: 'DEFAULT', secretAccessKey: 'DEFAULT' }
-    })
-  : new DynamoDBClient({});
+console.log("===== HANDLER LOADED =====");
+console.log("CONNECTIONS_TABLE =", CONNECTIONS_TABLE);
+console.log("MESSAGES_TABLE =", MESSAGES_TABLE);
+console.log("GEMINI =", GEMINI_API_KEY ? "FOUND" : "MISSING");
+console.log("IS_OFFLINE =", IS_OFFLINE);
+console.log("TABLE =", CONNECTIONS_TABLE);
 
+const dynamoDbClient = new DynamoDBClient({
+  region: 'us-east-1',
+  endpoint: 'http://127.0.0.1:8000',
+  credentials: {
+    accessKeyId: 'DEFAULT',
+    secretAccessKey: 'DEFAULT'
+  }
+});
+console.log('Using LOCAL DynamoDB @ 127.0.0.1:8000');
+console.log("DYNAMO ENDPOINT =", dynamoDbClient.config.endpoint);
 const docClient = DynamoDBDocumentClient.from(dynamoDbClient);
 const success = { statusCode: 200, body: 'Success' };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function getApiGatewayClient(event) {
-  if (IS_OFFLINE === 'true') {
+
+  if (IS_OFFLINE) {
+
+    console.log('Using LOCAL ApiGatewayManagementApiClient');
+
     return new ApiGatewayManagementApiClient({
       endpoint: 'http://localhost:4001',
       region: 'us-east-1',
-      credentials: { accessKeyId: 'DEFAULT', secretAccessKey: 'DEFAULT' }
+      credentials: {
+        accessKeyId: 'LOCAL',
+        secretAccessKey: 'LOCAL'
+      }
     });
   }
-  const endpoint = `https://${event.requestContext.domainName}/${event.requestContext.stage}`;
-  return new ApiGatewayManagementApiClient({ endpoint });
+
+  const endpoint =
+    `https://${event.requestContext.domainName}/${event.requestContext.stage}`;
+
+  return new ApiGatewayManagementApiClient({
+    endpoint
+  });
 }
 
 // Get all active connections in a specific room
@@ -77,7 +104,8 @@ module.exports.connect = async (event) => {
 
   console.log(`[CONNECT] ${username} → ${roomName} (${connectionId})`);
   console.log('CONNECTIONS_TABLE env:', CONNECTIONS_TABLE, 'MESSAGES_TABLE env:', MESSAGES_TABLE);
-
+  console.log("TABLE =", CONNECTIONS_TABLE);
+  console.log("DYNAMO ENDPOINT =", dynamoDbClient.config.endpoint);
   try {
     // Save this connection to DynamoDB
     await docClient.send(new PutCommand({
@@ -194,31 +222,26 @@ module.exports.sendMessage = async (event) => {
 
   // Broadcast message to entire room
   const connections = await getRoomConnections(roomName);
-  await broadcast(apigw, connections, { action: 'receiveMessage', ...messageItem });
 
-  // ── Real Gemini AI Integration ──────────────────────────────────────────────
-  if (body.text && body.text.toLowerCase().startsWith('@bot ')) {
-    const prompt = body.text.substring(5).trim();
-    
-    // Generate response using service module (handles both Gemini API and local mock fallback)
-    const botText = await generateAIResponse(prompt);
+try {
+  await broadcast(apigw, connections, {
+    action: 'receiveMessage',
+    ...messageItem
+  });
+} catch (err) {
+  console.error('Broadcast failed:', err);
+}
 
-    const botMessage = {
-      roomName,
-      timestamp: Date.now() + 1,
-      messageId: `bot-${Date.now()}`,
-      senderId: 'bot',
-      username: 'Nexus AI',
-      text: botText,
-      timeString: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    };
-
-    await docClient.send(new PutCommand({ TableName: MESSAGES_TABLE, Item: botMessage }));
-    await broadcast(apigw, connections, { action: 'receiveMessage', ...botMessage });
-  }
-
-  return success;
+return {
+  statusCode: 200,
+  body: JSON.stringify({
+    success: true,
+    message: 'Message sent'
+  })
 };
+};
+
+
 
 // ─── typing ──────────────────────────────────────────────────────────────────
 

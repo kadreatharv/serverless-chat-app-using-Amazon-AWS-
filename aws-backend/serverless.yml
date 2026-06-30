@@ -9,7 +9,6 @@ provider:
   environment:
     CONNECTIONS_TABLE: ${self:service}-connections-${sls:stage}
     MESSAGES_TABLE: ${self:service}-messages-${sls:stage}
-    GEMINI_API_KEY: ${env:GEMINI_API_KEY, ''}
   iam:
     role:
       statements:
